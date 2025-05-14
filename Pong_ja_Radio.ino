@@ -1,0 +1,270 @@
+#include <ezButton.h>
+#include <TFT_eSPI.h>
+#include "Arduino.h"
+#include "WiFi.h"
+#include "Audio.h"
+#include "Orbitron10pt7b.h"
+#include "Orbitron20pt7b.h"
+#include "Aerospace10pt7b.h"
+#include "Aerospace15pt7b.h"
+#include "Aerospace20pt7b.h"
+#include "SPIFFS.h"
+
+#include <ezTime.h>  // EzTime-kirjasto kellon ajan hakemiseen
+
+TFT_eSPI tft = TFT_eSPI();
+
+#define GFXFF 1
+#define ORBI10 &Orbitron_VariableFont_wght10pt7b
+#define ORBI20 &Orbitron_VariableFont_wght20pt7b
+#define AERO10 &Aerospace10pt7b
+#define AERO15 &Aerospace15pt7b
+#define AERO20 &Aerospace20pt7b
+
+#define I2S_DOUT 27
+#define I2S_BCLK 25
+#define I2S_LRC  26
+#define ROTARY_CLK_PIN 17
+#define ROTARY_DT_PIN  18
+#define ROTARY_SW_PIN  19
+
+String ssid = "moaiwlan";
+String password = "Ossi1Paavo234";
+
+struct Station {
+  const char* name;
+  const char* url;
+};
+
+Station stations[] = {
+  {"Capital\n     FM UK", "http://vis.media-ice.musicradio.com/CapitalMP3"},
+  {"Swiss\n     SRF 3", "http://stream.srg-ssr.ch/m/drs3/mp3_128"},
+  {"Swiss\n     Couleur\n     3", "http://stream.srg-ssr.ch/m/couleur3/mp3_128"},
+  {"Radio\n     Swiss\n     Pop", "http://stream.srg-ssr.ch/m/rsp/mp3_128"},
+  {"Virgin\n     Radio\n     Rock", "http://icy.unitedradio.it/Virgin.mp3"},
+  {"Classic\n     FM", "http://ice-sov.musicradio.com/ClassicFMMP3"},
+  {"Joint\n     Radio\n     Reggae", "http://star.jointil.net/proxy/jrn_reggae?mp=/stream"}
+};
+
+const int numStations = sizeof(stations) / sizeof(stations[0]);
+Audio audio;
+
+Timezone myTZ;  // Alustetaan EzTime-kirjaston Timezone-objekti
+
+// Aikainen määrä 2 painallukselle
+unsigned long lastPressTime = 0;
+unsigned long doubleClickInterval = 500;  // 500ms aikaikkuna, jossa toinen painallus tunnistetaan
+
+// Tilat
+bool isPongGameActive = false;
+
+class NetworkRadioController {
+private:
+  int stationIndex = 0;
+  int volume = 5;  // Set initial volume to 5
+  int lastClkState = HIGH;
+  int lastSwState = HIGH;
+  bool volumeMode = false;
+
+public:
+  void init() {
+    pinMode(ROTARY_CLK_PIN, INPUT_PULLUP);
+    pinMode(ROTARY_DT_PIN, INPUT_PULLUP);
+    pinMode(ROTARY_SW_PIN, INPUT_PULLUP);
+    Serial.println("NetworkRadioController initialized");
+  }
+
+  void processRotation() {
+    int clkState = digitalRead(ROTARY_CLK_PIN);
+    int dtState = digitalRead(ROTARY_DT_PIN);
+
+    if (clkState != lastClkState) {
+      if (clkState == LOW) {
+        if (dtState == HIGH) {
+          if (volumeMode) {
+            volume = min(volume + 1, 21); // Max volume is 21
+            audio.setVolume(volume);
+            updateVolumeDisplay();
+          } else {
+            stationIndex = (stationIndex + 1) % numStations;
+            changeStation();
+          }
+        } else {
+          if (volumeMode) {
+            volume = max(volume - 1, 0); // Min volume is 0
+            audio.setVolume(volume);
+            updateVolumeDisplay();
+          } else {
+            stationIndex = (stationIndex - 1 + numStations) % numStations;
+            changeStation();
+          }
+        }
+        delay(50);
+      }
+    }
+    lastClkState = clkState;
+  }
+
+  void processClick() {
+    int swState = digitalRead(ROTARY_SW_PIN);
+    if (swState == LOW && lastSwState == HIGH) {
+      volumeMode = !volumeMode; // Toggle volume mode
+      if (volumeMode) {
+        updateVolumeDisplay();
+      } else {
+        changeStation();
+      }
+      delay(200);
+    }
+    lastSwState = swState;
+  }
+
+  void changeStation() {
+    Serial.print("Selected Station: ");
+    Serial.println(stations[stationIndex].name);
+    audio.connecttohost(stations[stationIndex].url);
+    updateDisplay(stations[stationIndex].name);
+  }
+
+  void updateDisplay(const char* stationName) {
+    tft.fillScreen(TFT_BLACK);
+    tft.setCursor(40, 60);
+    tft.setTextColor(TFT_YELLOW);
+    tft.setFreeFont(ORBI20);
+    tft.print("Playing:");
+    tft.setTextColor(TFT_BLUE);
+    tft.setFreeFont(AERO15);
+    tft.setCursor(40, 100);
+    tft.print(stationName);
+  }
+
+  void updateVolumeDisplay() {
+    tft.fillScreen(TFT_BLACK);
+    tft.setCursor(40, 60);
+    tft.setTextColor(TFT_YELLOW);
+    tft.setFreeFont(ORBI20);
+    tft.print("Volume:");
+    tft.setTextColor(TFT_GREEN);
+    tft.setFreeFont(AERO20);
+    tft.setCursor(100, 180);
+    tft.print(volume);
+  }
+};
+
+// Funktio, joka tunnistaa kahden peräkkäisen painalluksen
+void checkDoubleClick() {
+  int swState = digitalRead(ROTARY_SW_PIN);
+  if (swState == LOW) {  // Jos painike painetaan
+    unsigned long currentTime = millis();
+    if (currentTime - lastPressTime <= doubleClickInterval) {
+      // Kahden peräkkäisen painalluksen tunnistus
+      if (!isPongGameActive) {
+        startPongGame();  // Käynnistetään Pong-peli
+      }
+    }
+    lastPressTime = currentTime;  // Päivitetään viimeisen painalluksen aika
+    delay(200);  // Estetään liikapainalluksia
+  }
+}
+
+// Funktio Pong-pelin käynnistämiseen
+void startPongGame() {
+  isPongGameActive = true;
+  // Tämä voi sisältää pelin aloituslogiikan, kuten:
+  // * Alustetaan pelin kenttä ja pelielementit (pallo, paddlet)
+  // * Asetetaan alkutilanne (pallon sijainti, nopeus jne.)
+  // * Piirretään pelin kenttä TFT-näytölle
+  Serial.println("Pong-peli käynnistetty!");
+  // Pelin piirtäminen voidaan aloittaa täällä
+}
+
+NetworkRadioController radioController;
+
+// Funktio, joka piirtää kuvan näytölle
+void drawImage() {
+    File f = SPIFFS.open("/Fani.bin", "r");  // Avaa binääritiedosto
+    if (!f) {
+        Serial.println("Tiedoston avaaminen epäonnistui");
+        return;
+    }
+
+    int width = 240;  // Kuvan leveys
+    int height = 240; // Kuvan korkeus
+
+    // Lue binääritiedosto ja piirrä pikselit
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            // Lue kaksi tavua (RGB565)
+            uint16_t color = f.read() | (f.read() << 8);
+            tft.drawPixel(x, y, color);
+        }
+    }
+
+    f.close();  // Sulje tiedosto
+}
+
+// Funktio, joka piirtää kellon ja kuvan
+void drawClock() {
+    String timeStr = myTZ.dateTime("H:i");  // HH:MM-muodossa
+
+    // Piirrä taustakuva
+    drawImage();
+
+    // Piirrä kellonaika taustakuvan päälle
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setFreeFont(ORBI20);
+    tft.setCursor(80, 200);
+    tft.print(timeStr);
+}
+
+void setup() {
+    Serial.begin(115200);
+    Serial.println("Starting setup...");
+
+    WiFi.disconnect();
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid.c_str(), password.c_str());
+    Serial.println("Attempting to connect to Wi-Fi...");
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.println("Connecting to Wi-Fi...");
+    }
+    Serial.println("Wi-Fi Connected!");
+
+    audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
+    audio.setVolume(5);
+    Serial.println("Audio setup complete");
+
+    tft.init();
+    tft.setRotation(2);
+
+    // **Alustetaan SPIFFS ja piirretään kuva**
+    if (!SPIFFS.begin(true)) {
+        Serial.println("SPIFFS alustus epäonnistui!");
+        return;
+    }
+
+    drawImage();  // Piirrä kuva
+
+    radioController.init();
+    radioController.changeStation();
+    myTZ.setLocation(F("Europe/Helsinki"));  // Asetetaan aikavyöhyke
+}
+
+void loop() {
+    radioController.processRotation();
+    radioController.processClick();
+    audio.loop();
+
+    // Päivitä kello kerran sekunnissa
+    static unsigned long lastUpdate = 0;
+    if (millis() - lastUpdate > 60000) {
+        drawClock();
+        lastUpdate = millis();
+    }
+
+    events();  // ezTime päivittää ajan
+
+    // Tarkista kaksinkertaiset painallukset
+    checkDoubleClick();
+}
